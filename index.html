@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NOLA Guesser</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.css">
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: #111; color: #fff; overflow: hidden; }
+  #viewer { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; background: #111; overflow: hidden; }
+  #streetPhoto { width: 100%; height: 100%; object-fit: cover; display: block; position: absolute; inset: 0; z-index: 1; }
+  #mlyContainer { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 2; }
+  .hud { position: absolute; top: 12px; left: 12px; z-index: 500; background: rgba(0,0,0,.65); padding: 8px 14px; border-radius: 10px; font-weight: 600; display: none; }
+  #guessWrap { position: absolute; right: 12px; bottom: 12px; z-index: 600; display: none; flex-direction: column; align-items: stretch; gap: 8px; }
+  #guessMap { width: 300px; height: 210px; border-radius: 12px; border: 2px solid rgba(255,255,255,.6); transition: width .2s, height .2s; opacity: .9; }
+  #guessWrap:hover #guessMap { width: min(620px, 92vw); height: min(460px, 60vh); opacity: 1; }
+  button { font: inherit; font-weight: 700; border: 0; border-radius: 10px; padding: 12px 18px; cursor: pointer; background: #7c3aed; color: #fff; }
+  button:disabled { background: #444; color: #999; cursor: not-allowed; }
+  button:hover:not(:disabled) { filter: brightness(1.12); }
+  .overlay { position: absolute; inset: 0; z-index: 1000; background: rgba(10,10,15,.94); display: none; align-items: center; justify-content: center; padding: 20px; }
+  .overlay.show { display: flex; }
+  .card { max-width: 520px; width: 100%; background: #1c1c26; border-radius: 16px; padding: 28px; }
+  .card h1, .card h2 { margin: 0 0 10px; }
+  .card p, .card li { color: #ccc; line-height: 1.5; }
+  .card input { width: 100%; padding: 12px; border-radius: 8px; border: 1px solid #444; background: #111; color: #fff; font: inherit; margin: 8px 0 14px; }
+  .card a { color: #a78bfa; }
+  .err { color: #f87171; min-height: 1.2em; margin: 0 0 10px; }
+  #resultOverlay { flex-direction: column; gap: 12px; }
+  #resultMap { width: min(900px, 100%); height: 60vh; border-radius: 14px; }
+  #resultInfo { font-size: 1.15rem; font-weight: 600; text-align: center; }
+  #loading { position: absolute; inset: 0; z-index: 900; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.7); font-size: 1.2rem; font-weight: 600; }
+  #loading.show { display: flex; }
+  .big { font-size: 3rem; font-weight: 800; color: #a78bfa; margin: 6px 0 14px; }
+</style>
+</head>
+<body>
+
+<div id="viewer">
+  <img id="streetPhoto" alt="New Orleans street view photo" style="display:none;">
+  <div id="mlyContainer"></div>
+</div>
+
+<div class="hud" id="hud"></div>
+<div id="loading">Finding a spot in New Orleans...</div>
+
+<div id="guessWrap">
+  <div id="guessMap"></div>
+  <button id="guessBtn" disabled>Place a pin on the map</button>
+</div>
+
+<!-- Setup screen -->
+<div class="overlay show" id="setup">
+  <div class="card">
+    <h1>NOLA Guesser ⚜️</h1>
+    <p>Guess where in New Orleans you are, using real street-level photos. 5 rounds per game.</p>
+    <p><b>One-time setup</b> (free, no credit card):</p>
+    <ol>
+      <li>Make a free account at <a href="https://www.mapillary.com/signup" target="_blank" rel="noopener">mapillary.com</a></li>
+      <li>Go to <a href="https://www.mapillary.com/dashboard/developers" target="_blank" rel="noopener">mapillary.com/dashboard/developers</a> and click <b>Register application</b></li>
+      <li>Name it anything, set the URL to anything (like <code>http://localhost</code>), then create it</li>
+      <li>Copy the <b>Client Token</b> (starts with <code>MLY|</code>) and paste it below</li>
+    </ol>
+    <input id="tokenInput" placeholder="MLY|123456789|abcdef..." autocomplete="off">
+    <p class="err" id="setupErr"></p>
+    <button id="startBtn">Start game</button>
+  </div>
+</div>
+
+<!-- Result screen -->
+<div class="overlay" id="resultOverlay">
+  <div id="resultMap"></div>
+  <div id="resultInfo"></div>
+  <button id="nextBtn">Next round</button>
+</div>
+
+<!-- Final screen -->
+<div class="overlay" id="finalOverlay">
+  <div class="card" style="text-align:center">
+    <h2>Game over</h2>
+    <div class="big" id="finalScore"></div>
+    <p id="finalBreakdown"></p>
+    <button id="againBtn">Play again</button>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/mapillary-js@4.1.2/dist/mapillary.js"></script>
+<script>
+(function () {
+  const TILE_URL = 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}';
+  const TILE_ATTR = 'Tiles &copy; Esri &mdash; Source: Esri, USGS, NOAA';
+
+  const BOUNDS = { s: 29.915, n: 30.010, w: -90.130, e: -90.000 };
+  const SEARCH_RADIUS = 0.003;
+  const ROUNDS = 5;
+  const SCORE_SCALE_KM = 3;
+  const MAX_SCORE = 5000;
+
+  let token = '';
+  let viewer = null;
+  let round = 0;
+  let scores = [];
+  let answer = null;
+  let guess = null;
+  let guessMarker = null;
+  let resultMap = null;
+  let resultLayer = null;
+
+  const $ = (id) => document.getElementById(id);
+  const rand = (a, b) => a + Math.random() * (b - a);
+
+  const guessMap = L.map('guessMap', { zoomControl: false, attributionControl: false })
+    .setView([29.96, -90.07], 11);
+
+  L.tileLayer(TILE_URL, { maxZoom: 18, attribution: TILE_ATTR }).addTo(guessMap);
+
+  new ResizeObserver(() => guessMap.invalidateSize()).observe($('guessMap'));
+
+  guessMap.on('click', (e) => {
+    guess = e.latlng;
+    if (guessMarker) guessMarker.setLatLng(guess);
+    else guessMarker = L.circleMarker(guess, { radius: 9, color: '#fff', weight: 2, fillColor: '#7c3aed', fillOpacity: 1 }).addTo(guessMap);
+    $('guessBtn').disabled = false;
+    $('guessBtn').textContent = 'Guess';
+  });
+
+  function haversineKm(a, b) {
+    const R = 6371, toRad = (d) => d * Math.PI / 180;
+    const dLat = toRad(b.lat - a.lat), dLon = toRad(b.lng - a.lng);
+    const x = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(a.lat)) * Math.cos(toRad(b.lat)) * Math.sin(dLon / 2) ** 2;
+    return 2 * R * Math.asin(Math.sqrt(x));
+  }
+
+  async function findRandomImage() {
+    for (let i = 0; i < 40; i++) {
+      const lat = rand(BOUNDS.s, BOUNDS.n), lon = rand(BOUNDS.w, BOUNDS.e);
+      const d = SEARCH_RADIUS;
+      const url = 'https://graph.mapillary.com/images?access_token=' + encodeURIComponent(token) +
+        '&fields=id,computed_geometry,thumb_2048_url,thumb_1024_url&limit=50&bbox=' + [lon - d, lat - d, lon + d, lat + d].join(',');
+      let res, json;
+      try {
+        res = await fetch(url);
+        json = await res.json();
+      } catch (e) {
+        throw new Error('Network error. Check your internet connection.');
+      }
+      if (json.error) {
+        if (json.error.code === 190 || res.status === 401 || res.status === 403) throw new Error('BAD_TOKEN');
+        continue;
+      }
+      const imgs = (json.data || []).filter((x) => x.computed_geometry && x.computed_geometry.coordinates && (x.thumb_2048_url || x.thumb_1024_url));
+      if (imgs.length) {
+        const pick = imgs[Math.floor(Math.random() * imgs.length)];
+        return {
+          id: pick.id,
+          lon: pick.computed_geometry.coordinates[0],
+          lat: pick.computed_geometry.coordinates[1],
+          url: pick.thumb_2048_url || pick.thumb_1024_url
+        };
+      }
+    }
+    throw new Error('Could not find street photos in this area. Click Start Game to try again.');
+  }
+
+  async function startRound() {
+    round++;
+    guess = null;
+    if (guessMarker) { guessMap.removeLayer(guessMarker); guessMarker = null; }
+    $('guessBtn').disabled = true;
+    $('guessBtn').textContent = 'Place a pin on the map';
+    guessMap.setView([29.96, -90.07], 11);
+    $('hud').style.display = 'block';
+    $('hud').textContent = 'Round ' + round + ' / ' + ROUNDS + '  •  Score: ' + scores.reduce((a, b) => a + b, 0);
+    $('loading').classList.add('show');
+
+    try {
+      const img = await findRandomImage();
+      answer = { lat: img.lat, lng: img.lon };
+
+      const imgEl = $('streetPhoto');
+      imgEl.src = img.url;
+      imgEl.style.display = 'block';
+
+      try {
+        if (!viewer && window.mapillary && window.mapillary.Viewer) {
+          viewer = new window.mapillary.Viewer({
+            accessToken: token,
+            container: 'mlyContainer',
+            imageId: img.id
+          });
+        } else if (viewer) {
+          await viewer.moveTo(img.id);
+        }
+      } catch (mlyErr) {
+        console.warn('Interactive viewer fallback active.', mlyErr);
+      }
+
+      setTimeout(() => { if (viewer) viewer.resize(); }, 150);
+      $('guessWrap').style.display = 'flex';
+    } catch (e) {
+      if (e.message === 'BAD_TOKEN') {
+        round = 0;
+        $('setupErr').textContent = 'That token did not work. Double check you copied the Client Token correctly.';
+        $('setup').classList.add('show');
+        $('hud').style.display = 'none';
+      } else {
+        alert(e.message);
+        round--;
+      }
+    }
+    $('loading').classList.remove('show');
+  }
+
+  function submitGuess() {
+    if (!guess) return;
+    const km = haversineKm(answer, guess);
+    const score = Math.round(MAX_SCORE * Math.exp(-km / SCORE_SCALE_KM));
+    scores.push(score);
+
+    $('guessWrap').style.display = 'none';
+    $('resultOverlay').classList.add('show');
+
+    if (!resultMap) {
+      resultMap = L.map('resultMap').setView([answer.lat, answer.lng], 13);
+      L.tileLayer(TILE_URL, { maxZoom: 18, attribution: TILE_ATTR }).addTo(resultMap);
+    }
+    if (resultLayer) resultMap.removeLayer(resultLayer);
+    resultLayer = L.layerGroup().addTo(resultMap);
+    L.circleMarker(answer, { radius: 10, color: '#fff', weight: 2, fillColor: '#22c55e', fillOpacity: 1 }).bindTooltip('Actual spot').addTo(resultLayer);
+    L.circleMarker(guess, { radius: 10, color: '#fff', weight: 2, fillColor: '#7c3aed', fillOpacity: 1 }).bindTooltip('Your guess').addTo(resultLayer);
+    L.polyline([answer, guess], { color: '#fff', dashArray: '6 8', weight: 3 }).addTo(resultLayer);
+    setTimeout(() => {
+      resultMap.invalidateSize();
+      resultMap.fitBounds(L.latLngBounds([answer, guess]), { padding: [60, 60], maxZoom: 16 });
+    }, 50);
+
+    const miles = km * 0.621371;
+    $('resultInfo').textContent = miles.toFixed(2) + ' mi (' + km.toFixed(2) + ' km) away  •  +' + score + ' points';
+    $('nextBtn').textContent = round >= ROUNDS ? 'See final score' : 'Next round';
+  }
+
+  function nextStep() {
+    $('resultOverlay').classList.remove('show');
+    if (round >= ROUNDS) {
+      const total = scores.reduce((a, b) => a + b, 0);
+      $('finalScore').textContent = total + ' / ' + (MAX_SCORE * ROUNDS);
+      $('finalBreakdown').textContent = scores.map((s, i) => 'Round ' + (i + 1) + ': ' + s).join('  •  ');
+      $('finalOverlay').classList.add('show');
+      $('hud').style.display = 'none';
+    } else {
+      startRound();
+    }
+  }
+
+  function newGame() {
+    round = 0;
+    scores = [];
+    $('finalOverlay').classList.remove('show');
+    startRound();
+  }
+
+  window.addEventListener('resize', () => { if (viewer) viewer.resize(); });
+
+  $('guessBtn').addEventListener('click', submitGuess);
+  $('nextBtn').addEventListener('click', nextStep);
+  $('againBtn').addEventListener('click', newGame);
+  $('startBtn').addEventListener('click', () => {
+    const t = $('tokenInput').value.trim();
+    if (!t.startsWith('MLY|')) {
+      $('setupErr').textContent = 'The token should start with MLY|';
+      return;
+    }
+    token = t;
+    try { localStorage.setItem('nolaGuesserToken', t); } catch (e) {}
+    $('setupErr').textContent = '';
+    $('setup').classList.remove('show');
+    newGame();
+  });
+
+  try {
+    const saved = localStorage.getItem('nolaGuesserToken');
+    if (saved) $('tokenInput').value = saved;
+  } catch (e) {}
+})();
+</script>
+</body>
+</html>
